@@ -24,7 +24,9 @@ A cross-project session finder + resumer for [Claude Code](https://code.claude.c
 ```
 ccs                     interactive picker over the newest 200 sessions
 ccs -m glm              picker with a ccm route preset (Enter resumes via
-                        `ccm run glm -- --resume <id>` — requires ccm)
+                        `ccm run glm -- --resume <id>` — requires
+                        [ccm](https://github.com/Thneoly/ccm), which also logs
+                        each launch to its launches.jsonl ledger)
 ccs <keyword>           full-text filter over the newest 500 transcripts
                         (path / topic / messages, case-insensitive)
 ccs -n 40               list 40 non-interactively; grows the picker pool
