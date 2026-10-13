@@ -1,0 +1,10 @@
+[package]
+name = "ccs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4.45"
+crossterm = "0.29.0"
+ratatui = "0.30.2"
+serde_json = "1.0.154"
