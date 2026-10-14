@@ -117,10 +117,8 @@ fn pick(terminal: &mut DefaultTerminal, rows: &[PickerRow], model: Option<&str>)
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return None;
                 }
-                KeyCode::Char('j') if key.modifiers.is_empty() => {
-                    if !filtered.is_empty() {
-                        state.select(Some(clamp_sel(sel + 1, filtered.len())));
-                    }
+                KeyCode::Char('j') if key.modifiers.is_empty() && !filtered.is_empty() => {
+                    state.select(Some(clamp_sel(sel + 1, filtered.len())));
                 }
                 KeyCode::Char('k') if key.modifiers.is_empty() => {
                     state.select(Some(sel.saturating_sub(1)));
@@ -128,25 +126,19 @@ fn pick(terminal: &mut DefaultTerminal, rows: &[PickerRow], model: Option<&str>)
                 KeyCode::Up => {
                     state.select(Some(sel.saturating_sub(1)));
                 }
-                KeyCode::Down => {
-                    if !filtered.is_empty() {
-                        state.select(Some(clamp_sel(sel + 1, filtered.len())));
-                    }
+                KeyCode::Down if !filtered.is_empty() => {
+                    state.select(Some(clamp_sel(sel + 1, filtered.len())));
                 }
                 KeyCode::PageUp => {
                     let page = 10.min(sel);
                     state.select(Some(sel - page));
                 }
-                KeyCode::PageDown => {
-                    if !filtered.is_empty() {
-                        state.select(Some(clamp_sel(sel + 10, filtered.len())));
-                    }
+                KeyCode::PageDown if !filtered.is_empty() => {
+                    state.select(Some(clamp_sel(sel + 10, filtered.len())));
                 }
                 KeyCode::Home => state.select(Some(0)),
-                KeyCode::End => {
-                    if !filtered.is_empty() {
-                        state.select(Some(filtered.len() - 1));
-                    }
+                KeyCode::End if !filtered.is_empty() => {
+                    state.select(Some(filtered.len() - 1));
                 }
                 KeyCode::Backspace => {
                     filter.pop();
