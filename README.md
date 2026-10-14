@@ -50,6 +50,10 @@ ccs --no-tui            force the plain listing on a terminal
 
 ## Install
 
+Prebuilt binaries are on the [Releases](https://github.com/Thneoly/ccs/releases) page, with a `checksums.txt` (`sha256sum -c`): `ccs-vX.Y.Z-x86_64-pc-windows-msvc.exe` for Windows, `ccs-vX.Y.Z-x86_64-unknown-linux-gnu` for Linux — put the binary on your `PATH`.
+
+Or build from source:
+
 ```sh
 git clone https://github.com/Thneoly/ccs.git
 cd ccs
@@ -57,7 +61,7 @@ cargo build --release
 # put target/release/ccs[.exe] on your PATH
 ```
 
-Dependencies: `serde_json`, `chrono`, `ratatui`, `crossterm`. Runs on Windows and Linux; `USERPROFILE`/`HOME` locates the projects directory.
+Dependencies: `serde_json`, `chrono`, `ratatui`, `crossterm`. Runs on Windows and Linux; `USERPROFILE`/`HOME` locates the projects directory. CI runs the same verify (fmt/check/test/clippy) plus a synthetic-home smoke on both platforms.
 
 ## Notes & limits
 
