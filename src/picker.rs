@@ -117,12 +117,6 @@ fn pick(terminal: &mut DefaultTerminal, rows: &[PickerRow], model: Option<&str>)
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return None;
                 }
-                KeyCode::Char('j') if key.modifiers.is_empty() && !filtered.is_empty() => {
-                    state.select(Some(clamp_sel(sel + 1, filtered.len())));
-                }
-                KeyCode::Char('k') if key.modifiers.is_empty() => {
-                    state.select(Some(sel.saturating_sub(1)));
-                }
                 KeyCode::Up => {
                     state.select(Some(sel.saturating_sub(1)));
                 }
@@ -238,7 +232,7 @@ fn draw(
     };
     let footer_line = Line::from(vec![
         Span::styled(
-            " ↑↓/jk select · type filter · ⌫ edit · ",
+            " ↑↓ select · type filter · ⌫ edit · ",
             Style::default().fg(Color::DarkGray),
         ),
         Span::styled(enter_hint, Style::default().fg(Color::Green)),
