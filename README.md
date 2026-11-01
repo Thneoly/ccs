@@ -4,19 +4,26 @@ A cross-project session finder + resumer for [Claude Code](https://code.claude.c
 
 **The problem:** Claude Code stores each session under `~/.claude/projects/<encoded-cwd>/`, scoped to the directory it started in. `claude --continue` only continues in the current directory, and the `--resume` picker assumes you already remember *which* project a session lived in. With 40+ project directories, "where was that session?" becomes its own task.
 
-**ccs** lists recent sessions across **all** projects — time, project path, and the first user message as a topic — and reopens one in its original directory.
+**ccs** lists recent sessions across **all** projects — time, project path, and a topic (the model-written session title when there is one, else the opening / last user message) — and reopens one in its original directory.
 
 ## Two modes, the claude cli pattern
 
 | Invocation | Behavior |
 |---|---|
-| `ccs` (on a terminal) | Interactive picker: arrows to select, type to filter, `Enter` resumes in the session's original directory |
+| `ccs` (on a terminal) | Interactive picker: arrows to select, type to filter id/path/topic, `/` to search message content, `Tab` for an end-of-session preview, `Enter` resumes in the session's original directory |
 | `ccs` (piped), `ccs -n 40`, `ccs <keyword>`, `ccs open <n>`, `ccs --no-tui` | Plain, pipe-friendly, scriptable output |
 
 ```
-  1 10-13 22:09  D:/Project/ccm        阅读下： README.md ↓ docs/DESIGN.md ↓ …
-  2 10-13 22:09  D:/R2R-Agent/doc      阅读doc/document.txt, 拆分意图
-  3 10-13 21:40  D:/Project            使用CDP 打开阅读 https://chatgpt.com/share/…
+$ ccs
+  1 11-02 07:24  D:/Project/ccs        ★ 大写字母输入与 multica workspace
+  2 11-02 07:15  D:/Project            ★ ChatGPT 分享对话整理
+  3 11-02 07:15  D:/SRE/sre-inspection-graph   ★ 项目本地启动
+
+$ ccs deploy
+  1 11-02 07:15  D:/Project            ★ ChatGPT 分享对话整理
+      └ 你: …neoly is attempting to deploy a commit to the IndexLa…
+  2 11-02 07:15  D:/SRE/sre-inspection-graph   ★ 项目本地启动
+      └ ai: …t namespace 里有 7 个 deployment,是最丰富的。看看…
 ```
 
 ## Usage
@@ -30,7 +37,10 @@ ccs -m glm              picker with a ccm route preset (Enter resumes via
 ccs <keyword>           filter over the newest 500 transcripts; a match
                         counts only inside conversation text (user /
                         assistant messages, case-insensitive) — tool
-                        output and harness boilerplate never match
+                        output and harness boilerplate never match. Each
+                        hit shows a 你:/ai: context line pointing at the
+                        matched words (skipped when the topic already
+                        contains the keyword)
 ccs -n 40               list 40 non-interactively; grows the picker pool
                         past its 200-row floor on a terminal
 ccs --all               also include machine-generated agent workspaces
@@ -51,7 +61,8 @@ ccs --no-tui            force the plain listing on a terminal
 - Sessions are read from `~/.claude/projects/<dir>/<uuid>.jsonl`. The real `cwd` always comes from the records inside the transcript; the encoded directory name is only a lossy fallback (hyphens are ambiguous), shown with a `~` mark — such rows are display-only and cannot be opened.
 - The topic is the model-written session title (`★`) when the transcript has one (Claude Code's `ai-title` records, recent versions only — it summarizes the whole conversation, not just the opening); else the first user message that is not a harness wrapper (command output, caveats); else the session's **last** user input (`≫`, "where it ended" — from a bounded 128KB tail read); else the first assistant text.
 - Machine-generated agent workspaces — sessions agents mint in hash-named scratch dirs, e.g. `.../tuweiwu-7ef8b5c1bd5b/call-10-31bc8a6e6e05/workdir` (detected as a bare hex fragment ≥ 8 chars **containing a letter**, split out of a path segment), and anything run under the OS temp directory (`%TEMP%` / `/tmp`) — are skipped by default **without consuming a pool slot** (and out of the keyword scan window), so an agent storm cannot crowd real projects out of the newest-sessions view. `--all` includes them everywhere. The hex signature is deliberately generic: it also catches hex-named tool caches (cargo registry, bazel) and hex-word project dirs — `--all` is the escape hatch.
-- In the picker, `/` enters a content search over message text (terms are ANDed; conversation text only, same domain as the CLI keyword search; the scan runs in the background so the UI stays alive), and `Tab` toggles an end-of-session preview — the last user input, the last assistant reply, the branch at end, and the last activity time, from a bounded 128KB tail read. Where a session ENDED is often the memory hook when the opening line is generic.
+- In the picker, `/` enters a content search over message text (terms are ANDed; conversation text only, same domain as the CLI keyword search; the scan runs in the background so the UI stays alive; Enter on an empty query clears the results back to the full list), and `Tab` toggles an end-of-session preview — the last user input, the last assistant reply, the branch at end, and the last activity time, from a bounded 128KB tail read. Where a session ENDED is often the memory hook when the opening line is generic.
+- Text is truncated by display width — CJK characters and emoji occupy two columns, so Chinese topics line up instead of running past the column.
 - Resume reuses the verified behavior that `claude --resume <id>` works from any directory; the gateway/model is whatever the launching environment provides — start it via ccm (`-m`) when you want routed credentials.
 - On Windows, plain `claude` is spawned through `cmd /c` because npm installs ship `.cmd` shims that `CreateProcessW` cannot resolve.
 - Reads only the transcripts directory; writes only a small listing cache (`%TEMP%/ccs-list.txt`). No config.
@@ -73,8 +84,9 @@ Dependencies: `serde_json`, `chrono`, `ratatui`, `crossterm`. Runs on Windows an
 
 ## Notes & limits
 
-- The keyword filter scans the newest `max(n, 500)` transcripts — matches older than that are invisible; raise with `-n`.
+- The keyword filter scans the newest `max(n, 500)` transcripts — matches older than that are invisible; raise with `-n`. The picker's `/` content search scans the pool the listing shows (newest `max(n, 200)`).
 - `open <n>` numbers come from the machine-wide last **non-interactive** listing (bare `ccs` on a terminal opens the picker and does not refresh it); refresh with `ccs --no-tui`.
+- `★` marks a model-written session title, `≫` the session's last user input (used when no opening line survived the wrapper filter); plain rows show the first user message. Harness wrappers (command output, caveats) never count as your words — not as topics, not as matches, not in the preview.
 - Tested on Windows (Windows Terminal) against real transcript directories; interactive-mode key handling filters `KeyEventKind::Press` (crossterm emits Press+Release pairs on Windows).
 
 ## License

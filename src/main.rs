@@ -1108,7 +1108,9 @@ USAGE
   ccs <keyword>         filter over the newest max(n,500) transcripts;
                         a match counts only inside conversation text
                         (user / assistant messages, any case) - tool
-                        output and harness boilerplate never match
+                        output and harness boilerplate never match. Hits
+                        carry a 你:/ai: context line when the topic does
+                        not already show the keyword
   ccs open <n>          resume session n in its original directory
   ccs open <n> -m glm   same, routed through ccm (ccm run glm -- --resume <id>)
   ccs open <n> --print  print a paste-ready command (PowerShell syntax)
