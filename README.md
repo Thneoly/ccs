@@ -31,6 +31,8 @@ ccs <keyword>           full-text filter over the newest 500 transcripts
                         (path / topic / messages, case-insensitive)
 ccs -n 40               list 40 non-interactively; grows the picker pool
                         past its 200-row floor on a terminal
+ccs --all               also include machine-generated agent workspaces
+                        (see below) that the default views skip
 ccs open <n>            resume session n from the last listing, spawning
                         `claude --resume <id>` with the child's cwd set to
                         the session's original directory
@@ -44,6 +46,7 @@ ccs --no-tui            force the plain listing on a terminal
 
 - Sessions are read from `~/.claude/projects/<dir>/<uuid>.jsonl`. The real `cwd` always comes from the records inside the transcript; the encoded directory name is only a lossy fallback (hyphens are ambiguous), shown with a `~` mark — such rows are display-only and cannot be opened.
 - The topic is the first user message that is not a harness wrapper (command output, caveats).
+- Machine-generated agent workspaces — sessions agents mint in hash-named scratch dirs, e.g. `.../tuweiwu-7ef8b5c1bd5b/call-10-31bc8a6e6e05/workdir` (detected as a bare hex fragment ≥ 8 chars **containing a letter**, split out of a path segment), and anything run under the OS temp directory (`%TEMP%` / `/tmp`) — are skipped by default **without consuming a pool slot**, so an agent storm cannot crowd real projects out of the newest-sessions view. `--all` includes them; keyword search always scans them. The hex signature is deliberately generic: it also catches hex-named tool caches (cargo registry, bazel) and hex-word project dirs — `--all` is the escape hatch.
 - Resume reuses the verified behavior that `claude --resume <id>` works from any directory; the gateway/model is whatever the launching environment provides — start it via ccm (`-m`) when you want routed credentials.
 - On Windows, plain `claude` is spawned through `cmd /c` because npm installs ship `.cmd` shims that `CreateProcessW` cannot resolve.
 - Reads only the transcripts directory; writes only a small listing cache (`%TEMP%/ccs-list.txt`). No config.

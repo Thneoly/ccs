@@ -72,8 +72,10 @@ pub fn typeable_modifiers(m: KeyModifiers) -> bool {
 }
 
 /// Run the picker on a TTY stdout. A piped stdout reports Failed so the
-/// caller can list plainly.
-pub fn run(rows: &[PickerRow], model: Option<&str>) -> Pick {
+/// caller can list plainly. `hidden` is the count of machine-generated
+/// agent-workspace sessions the scan skipped (0 = none) — shown in the
+/// header so the smaller pool is not a mystery.
+pub fn run(rows: &[PickerRow], model: Option<&str>, hidden: usize) -> Pick {
     if !std::io::stdout().is_tty() {
         return Pick::Failed;
     }
@@ -91,7 +93,7 @@ pub fn run(rows: &[PickerRow], model: Option<&str>) -> Pick {
         default_panic(info);
     }));
 
-    let result = pick(&mut terminal, rows, model);
+    let result = pick(&mut terminal, rows, model, hidden);
 
     let _ = teardown();
     // the panic hook stays installed: after the picker, teardown is
@@ -108,7 +110,12 @@ fn refilter(rows: &[PickerRow], filter: &str) -> Vec<usize> {
         .collect()
 }
 
-fn pick(terminal: &mut DefaultTerminal, rows: &[PickerRow], model: Option<&str>) -> Option<usize> {
+fn pick(
+    terminal: &mut DefaultTerminal,
+    rows: &[PickerRow],
+    model: Option<&str>,
+    hidden: usize,
+) -> Option<usize> {
     let mut filter = String::new();
     let mut filtered = refilter(rows, &filter);
     // The TableState lives HERE (not in the render fn) so its scroll
@@ -119,7 +126,7 @@ fn pick(terminal: &mut DefaultTerminal, rows: &[PickerRow], model: Option<&str>)
         state.select(Some(sel));
 
         terminal
-            .draw(|frame| draw(frame, rows, &filtered, &mut state, &filter, model))
+            .draw(|frame| draw(frame, rows, &filtered, &mut state, &filter, model, hidden))
             .ok()?;
 
         // Windows emits TWO Key events per physical press (Press + Release);
@@ -185,6 +192,7 @@ fn draw(
     state: &mut TableState,
     filter: &str,
     model: Option<&str>,
+    hidden: usize,
 ) {
     let [header, table_area, footer] = Layout::vertical([
         Constraint::Length(1),
@@ -198,10 +206,16 @@ fn draw(
     } else {
         format!(" · {}/{}", filtered.len(), rows.len())
     };
+    let skipped = if hidden > 0 {
+        format!(" · {hidden} hidden (--all)")
+    } else {
+        String::new()
+    };
     let route = model.map(|m| format!(" · ccm: {m}")).unwrap_or_default();
     let header_line = Line::from(vec![
         Span::styled(" ccs", Style::default().fg(Color::Cyan).bold()),
         Span::raw(shown),
+        Span::styled(skipped, Style::default().fg(Color::DarkGray)),
         Span::raw(route),
         Span::raw(" · filter: "),
         Span::styled(format!("{filter}█"), Style::default().fg(Color::Yellow)),

@@ -18,6 +18,10 @@
 //   ccs -n 40            list 40 when non-interactive (piped, keyword,
 //                        or --no-tui); on a terminal it only grows the
 //                        picker pool past its 200-row floor
+//   ccs -a, --all        include the machine-generated agent workspaces
+//                        (hex-id worktree/task dirs) the default views
+//                        skip, so an agent storm cannot crowd real
+//                        projects out of the newest-sessions view
 //   ccs <keyword>        full-text filter across the newest max(n,500)
 //                        transcripts (path / topic / messages, any case)
 //   ccs open <n>         resume session n from the last listing: spawn
@@ -35,6 +39,14 @@
 // `open <n>` resolves against the machine-wide LAST listing — which only
 // a NON-interactive listing refreshes (bare `ccs` on a terminal opens the
 // picker and never rewrites it); refresh with `ccs --no-tui`.
+// Machine-generated agent workspaces (a path segment splitting into a
+// bare hex fragment of 8+ chars that contains a letter, e.g. multica's
+// .../call-10-31bc8a6e6e05/workdir worktrees; and anything under the OS
+// temp directory, e.g. %TEMP%/dsh-ccacp-probe-*) are skipped without
+// consuming a pool slot in the default views; --all includes them,
+// keyword search always scans them. The hex signature also catches
+// hex-named tool caches (cargo registry, bazel) — --all is the escape
+// hatch.
 // Reads only the transcripts directory; writes only the cache file.
 
 mod picker;
@@ -69,6 +81,7 @@ fn run(args: &[String]) -> i32 {
     let mut keyword: Option<String> = None;
     let mut model: Option<String> = None;
     let mut no_tui = false;
+    let mut all = false;
     let mut positional: Vec<String> = Vec::new();
     let mut sub_idx: Option<usize> = None;
     let mut i = 0;
@@ -100,6 +113,7 @@ fn run(args: &[String]) -> i32 {
                 }
             }
             "--no-tui" => no_tui = true,
+            "-a" | "--all" => all = true,
             "-h" | "--help" | "help" => {
                 print_usage();
                 return 0;
@@ -176,55 +190,57 @@ fn run(args: &[String]) -> i32 {
     }
     files.sort_by_key(|f| std::cmp::Reverse(f.1));
 
-    // pool sizing: picker browses max(n,200); keyword mode full-text scans
-    // the newest max(n,500); plain listing shows exactly n.
-    let pool = if interactive {
-        n.max(200)
-    } else if keyword.is_some() {
-        n.max(500)
-    } else {
-        n
-    };
-    let mut selected: Vec<&(PathBuf, u64)> = files.iter().take(pool).collect();
+    // ── candidate selection, newest first ────────────────────────────────
+    // Keyword mode full-text scans the newest max(n,500) transcripts and
+    // keeps the newest n matches — a search is explicit intent, so nothing
+    // is ever hidden there. Every other shape parses transcript heads
+    // newest first until it has `cap` visible rows: machine-generated
+    // agent workspaces (is_generated_workspace) are skipped without
+    // consuming a slot, so an agent storm minting dozens of hash-named
+    // worktrees a day cannot crowd real projects out of the view. Worst
+    // case (nearly everything generated) parses a head per transcript —
+    // the same read order as keyword mode's full-text scan.
+    let cap = if interactive { n.max(200) } else { n };
+    let hide_generated = keyword.is_none() && !all;
+    let temp_root = env::temp_dir().to_string_lossy().into_owned();
+
+    let mut entries: Vec<picker::PickerRow> = Vec::new();
+    let mut hidden = 0usize;
     if let Some(kw) = &keyword {
         let needle = kw.to_lowercase();
-        selected.retain(|(path, _)| {
+        for (path, secs) in files.iter().take(n.max(500)) {
             let Ok(raw) = fs::read(path) else {
-                return false;
+                continue;
             };
             // lossy decode: one bad byte must not hide a whole transcript
-            String::from_utf8_lossy(&raw)
+            if !String::from_utf8_lossy(&raw)
                 .to_lowercase()
                 .contains(&needle)
-        });
-    }
-    // the picker browses its whole pool; non-interactive shapes show n
-    let cap = if interactive { pool } else { n };
-    let selected: Vec<&(PathBuf, u64)> = selected.into_iter().take(cap).collect();
-
-    // ── per-session metadata from the transcript head ─────────────────────
-    let mut entries: Vec<picker::PickerRow> = Vec::new();
-    for (path, secs) in selected.iter() {
-        let id = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?")
-            .to_string();
-        let info = head_info(path);
-        let reliable = info.0.is_some();
-        let cwd = info.0.unwrap_or_else(|| encoded_fallback(path));
-        entries.push(picker::PickerRow {
-            id,
-            cwd,
-            reliable,
-            topic: info.1,
-            time: format_mtime(*secs),
-        });
+            {
+                continue;
+            }
+            entries.push(row_for(path, *secs));
+            if entries.len() >= n {
+                break;
+            }
+        }
+    } else {
+        for (path, secs) in files.iter() {
+            if entries.len() >= cap {
+                break;
+            }
+            let row = row_for(path, *secs);
+            if hide_generated && is_generated_workspace(&row.cwd, &temp_root) {
+                hidden += 1;
+                continue;
+            }
+            entries.push(row);
+        }
     }
 
     // ── interactive picker ─────────────────────────────────────────────────
     if interactive {
-        match picker::run(&entries, model.as_deref()) {
+        match picker::run(&entries, model.as_deref(), hidden) {
             picker::Pick::Chosen(idx) => {
                 let row = &entries[idx];
                 return open_entry(&row.id, &row.cwd, row.reliable, model.as_deref(), false);
@@ -255,7 +271,13 @@ fn run(args: &[String]) -> i32 {
     let _ = fs::write(cache_path(), body);
 
     if entries.is_empty() {
-        out("ccs: no sessions matched");
+        if hidden > 0 {
+            out(&format!(
+                "ccs: no sessions matched ({hidden} machine-generated agent workspaces hidden; ccs --all shows them)"
+            ));
+        } else {
+            out("ccs: no sessions matched");
+        }
         return 0;
     }
     for (idx, r) in entries.iter().enumerate() {
@@ -274,6 +296,13 @@ fn run(args: &[String]) -> i32 {
     out("");
     out("ccs open <n>          resume there (plain claude)");
     out("ccs open <n> -m glm   resume routed via ccm");
+    if hidden > 0 {
+        // "re-list", not "append": --all lists the newest n overall, so
+        // hidden rows displace older visible ones rather than extend them
+        out(&format!(
+            "ccs --all             re-list with the {hidden} machine-generated agent workspace session(s) included"
+        ));
+    }
     0
 }
 
@@ -508,6 +537,63 @@ fn encoded_fallback(path: &std::path::Path) -> String {
     re.replace(['-', '\\'], "/")
 }
 
+/// One transcript file -> one picker row: id from the file stem, cwd and
+/// topic from the transcript head, mtime formatted for display.
+fn row_for(path: &std::path::Path, secs: u64) -> picker::PickerRow {
+    let id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("?")
+        .to_string();
+    let info = head_info(path);
+    let reliable = info.0.is_some();
+    let cwd = info.0.unwrap_or_else(|| encoded_fallback(path));
+    picker::PickerRow {
+        id,
+        cwd,
+        reliable,
+        topic: info.1,
+        time: format_mtime(secs),
+    }
+}
+
+/// Machine-generated agent workspaces — worktrees and task dirs minted
+/// with a hex id (`.../tuweiwu-7ef8b5c1bd5b/call-10-31bc8a6e6e05/workdir`,
+/// `.../tuwe-5-a52f1d66d96d/worktree`) and anything spawned under the OS
+/// temp directory (`%TEMP%/dsh-ccacp-probe-G1nBohF`) — are
+/// indistinguishable by eye, never deliberately resumed, and an agent
+/// storm can mint dozens a day, crowding real projects out of the
+/// newest-sessions view. Signatures: a `/`-separated path segment which,
+/// split on `-`/`_`, yields a bare hex fragment >= 8 chars with a letter
+/// in it (the letter keeps digit-only names — compact dates like
+/// `20251101` — visible), or a cwd anywhere under `temp_root` (temp is
+/// ephemeral by contract). `--all` shows them anyway; keyword search
+/// always scans them. Pure — pinned by tests (temp_root passed in so the
+/// predicate stays machine-independent).
+fn is_generated_workspace(cwd: &str, temp_root: &str) -> bool {
+    cwd.split(['/', '\\'])
+        .flat_map(|seg| seg.split(['-', '_']))
+        .any(|part| {
+            part.len() >= 8
+                && part.chars().all(|c| c.is_ascii_hexdigit())
+                && part.chars().any(|c| c.is_ascii_alphabetic())
+        })
+        || is_under(cwd, temp_root)
+}
+
+/// Component-wise case-insensitive "cwd is under root" (Windows paths
+/// disagree on case and separators between records and env). Pure —
+/// pinned by tests.
+fn is_under(cwd: &str, root: &str) -> bool {
+    if root.is_empty() {
+        return false;
+    }
+    let norm = |s: &str| s.replace('\\', "/").to_lowercase();
+    let c = norm(cwd);
+    let r = norm(root).trim_end_matches('/').to_string();
+    c == r || c.starts_with(&format!("{r}/"))
+}
+
 /// Local time is what a human compares against their terminal history;
 /// chrono::Local keeps that honest across DST and timezones.
 fn format_mtime(secs: u64) -> String {
@@ -530,6 +616,10 @@ USAGE
   ccs --no-tui          force the plain listing on a terminal
   ccs -n 40             list 40 when non-interactive; on a terminal only
                         grows the picker pool past its 200-row floor
+  ccs -a, --all         include the machine-generated agent workspaces
+                        (hex-id worktree/task dirs) the default views
+                        skip, so agent storms cannot crowd out real
+                        projects
   ccs <keyword>         full-text filter over the newest max(n,500)
                         transcripts (path / topic / messages, any case)
   ccs open <n>          resume session n in its original directory
@@ -542,6 +632,78 @@ NOTES
   are read from ~/.claude/projects (never modified). open/id resolve
   against the machine-wide LAST listing - re-run ccs first if you listed
   with a different filter elsewhere. The ~ mark flags a cwd that was not
-  on record (lossy directory-name decode); such rows cannot be opened.",
+  on record (lossy directory-name decode); such rows cannot be opened.
+  Machine-generated agent workspaces (a path segment splitting into a
+  bare hex fragment of 8+ chars containing a letter, e.g.
+  .../call-10-31bc8a6e6e05/workdir worktrees; and anything under the OS
+  temp directory, e.g. %TEMP%/dsh-*) are skipped by default so they don't
+  crowd out real projects; --all includes them and keyword search always
+  scans them. Hex-named tool caches (cargo registry, bazel) match the
+  same signature - use --all.",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_generated_workspace, is_under};
+
+    const TMP: &str = "C:/Users/x/AppData/Local/Temp";
+
+    #[test]
+    fn hex_id_segments_flag_generated_workspaces() {
+        // real shapes seen under ~/.claude/projects
+        assert!(is_generated_workspace(
+            "D:\\multica-workspaces\\tuweiwu-7ef8b5c1bd5b\\tuwe-5-a52f1d66d96d\\worktree",
+            TMP
+        ));
+        assert!(is_generated_workspace(
+            "D:/multica-workspaces/callisto-zg-deacf13231f4/call-10-31bc8a6e6e05/workdir",
+            TMP
+        ));
+        assert!(is_generated_workspace(
+            "C:/Users/x/multica/workspaces/desktop/api/multica-ai/proteus/vgm-a313551a4e5f/task-24fc52e85ec9/workdir",
+            TMP
+        ));
+        // mixed-case hex counts
+        assert!(is_generated_workspace("D:/x/A52F1D66D96D/y", TMP));
+    }
+
+    #[test]
+    fn temp_dir_cwds_flag_generated_workspaces() {
+        // the real dsh scratch shape (7-char mixed-case id, no hex hit)
+        assert!(is_generated_workspace(
+            "C:\\Users\\45110\\AppData\\Local\\Temp\\dsh-real-acp-gate-cOQZOV",
+            "C:\\Users\\45110\\AppData\\Local\\Temp"
+        ));
+        // separator + case disagreement between cwd and env root
+        assert!(is_under(
+            "C:\\users/x\\AppData/local\\Temp\\dsh-ccacp-probe-G1nBohF",
+            "C:/Users/x/AppData/Local/Temp/"
+        ));
+        assert!(is_under("/tmp/foo/bar", "/tmp"));
+        assert!(is_under("/tmp", "/tmp/"));
+        // component boundary: /tmpfoo is NOT under /tmp
+        assert!(!is_under("/tmpfoo", "/tmp"));
+        assert!(!is_under("D:/Project/ccs", TMP));
+        // degenerate empty root matches nothing
+        assert!(!is_under("C:/anything", ""));
+    }
+
+    #[test]
+    fn human_named_dirs_stay_visible() {
+        assert!(!is_generated_workspace("D:/Project/ccs", TMP));
+        assert!(!is_generated_workspace("D:/Project/r2r-multica", TMP));
+        assert!(!is_generated_workspace("D:/FDE/fde-student-w01-0-2-0", TMP));
+        // a hex fragment inside a hyphenated name is human naming
+        assert!(!is_generated_workspace("D:/Project/proj-2b3c4d5", TMP));
+        // compact dates are pure digits — no letter, stays visible
+        assert!(!is_generated_workspace("D:/notes/20251101", TMP));
+        assert!(!is_generated_workspace("D:/notes/2026-11-01", TMP));
+        // too short to be a machine id, and not under TMP
+        assert!(!is_generated_workspace(
+            "D:/workspaces/dsh/probe/G1nBohF",
+            TMP
+        ));
+        assert!(!is_generated_workspace("", TMP));
+    }
 }
