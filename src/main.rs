@@ -209,6 +209,8 @@ fn run(args: &[String]) -> i32 {
     let temp_root = env::temp_dir().to_string_lossy().into_owned();
 
     let mut entries: Vec<picker::PickerRow> = Vec::new();
+    // keyword-mode match context lines, parallel to entries (empty elsewhere)
+    let mut snippets: Vec<String> = Vec::new();
     let mut hidden = 0usize;
     if let Some(kw) = &keyword {
         let needle = kw.to_lowercase();
@@ -230,11 +232,20 @@ fn run(args: &[String]) -> i32 {
             // tool output) is identical across sessions and matches
             // every query, collapsing search into "list the newest n"
             let raw_s = String::from_utf8_lossy(&raw);
-            if !raw_s.to_lowercase().contains(&needle) || human_text_hit(&raw_s, &needle).is_none()
-            {
+            // C-speed prefilter FIRST — human_text_hit parses every
+            // message line, far too slow to run on non-matching files
+            if !raw_s.to_lowercase().contains(&needle) {
                 continue;
             }
+            let Some(hit) = human_text_hit(&raw_s, &needle) else {
+                continue;
+            };
             entries.push(row);
+            // whose words matched and where — the topic often has nothing
+            // to do with the match point, which is why a hit list of bare
+            // topics forced opening sessions one by one to tell them apart
+            let who = if hit.role == "user" { "你" } else { "ai" };
+            snippets.push(format!("{who}: {}", snippet_around(&hit.text, &needle, 56)));
             if entries.len() >= n {
                 break;
             }
@@ -307,6 +318,17 @@ fn run(args: &[String]) -> i32 {
             proj,
             topic
         ));
+        // the match context line: only when the topic does not already
+        // contain the keyword (otherwise the snippet would just repeat
+        // what the row above shows)
+        if let Some(s) = snippets.get(idx)
+            && !s.is_empty()
+            && !keyword
+                .as_ref()
+                .is_some_and(|k| r.topic.to_lowercase().contains(&k.to_lowercase()))
+        {
+            out(&format!("      └ {s}"));
+        }
     }
     out("");
     out("ccs open <n>          resume there (plain claude)");
@@ -652,6 +674,66 @@ fn encoded_fallback(path: &std::path::Path) -> String {
     re.replace(['-', '\\'], "/")
 }
 
+/// A single-line, width-budgeted window around the first `needle` hit in
+/// `text` — whitespace squashed, ellipsized at both ends when the window
+/// cuts. The needle itself always survives whole: the window is grown
+/// outward from the hit by DISPLAY width, never cut afterward (a
+/// char-counted cut slices through the keyword on CJK-heavy lines).
+/// Empty when the needle is not in the text at all. Pure — pinned by
+/// tests.
+fn snippet_around(text: &str, needle: &str, budget: usize) -> String {
+    let flat = picker::squash(text);
+    let Some(pos) = flat.to_lowercase().find(needle) else {
+        return String::new();
+    };
+    let chars: Vec<char> = flat.chars().collect();
+    let hit_cp = flat[..pos].chars().count();
+    let needle_cp = needle.chars().count();
+    let needle_w = picker::display_width(needle);
+    // width each side may spend so needle + context + ellipses fit
+    let side = budget.saturating_sub(needle_w + 2) / 2;
+
+    let mut left = String::new();
+    let mut w = 0;
+    let mut i = hit_cp;
+    while i > 0 {
+        let c = chars[i - 1];
+        if w + picker::char_width(c) > side {
+            break;
+        }
+        left.insert(0, c);
+        w += picker::char_width(c);
+        i -= 1;
+    }
+    let cut_start = i > 0;
+
+    let mut right = String::new();
+    let mut w = 0;
+    let mut j = hit_cp + needle_cp;
+    while j < chars.len() {
+        let c = chars[j];
+        if w + picker::char_width(c) > side {
+            break;
+        }
+        right.push(c);
+        w += picker::char_width(c);
+        j += 1;
+    }
+    let cut_end = j < chars.len();
+
+    let mut window = String::new();
+    if cut_start {
+        window.push('…');
+    }
+    window.push_str(&left);
+    window.extend(&chars[hit_cp..hit_cp + needle_cp]);
+    window.push_str(&right);
+    if cut_end {
+        window.push('…');
+    }
+    window
+}
+
 /// A keyword hit inside human-visible conversation text.
 #[derive(Debug, PartialEq)]
 pub(crate) struct TextHit {
@@ -914,6 +996,29 @@ mod tests {
         // thinking blocks are not visible text
         let think = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"deploy maybe\"}]}}";
         assert_eq!(human_text_hit(&think, "deploy"), None);
+    }
+
+    #[test]
+    fn snippet_windows_around_the_first_hit() {
+        use super::snippet_around;
+        // hit in the middle: window on both sides, ellipsized
+        let s = snippet_around(
+            "先把环境检查一遍 然后 我们聊聊 deploy 的事情 再说",
+            "deploy",
+            20,
+        );
+        assert!(s.contains("deploy"));
+        assert!(s.starts_with('…') && s.ends_with('…'));
+        // hit at the very start: no leading ellipsis
+        let s = snippet_around("deploy 在开头", "deploy", 20);
+        assert!(s.starts_with("deploy"));
+        assert!(!s.starts_with('…'));
+        // no hit at all
+        assert_eq!(snippet_around("nothing here", "deploy", 20), "");
+        // CJK budget is display columns: 10-col budget holds 4 CJK chars
+        let s = snippet_around("甲乙丙丁deploy戊己庚辛", "deploy", 12);
+        assert!(crate::picker::display_width(&s) <= 12);
+        assert!(s.contains("deploy"));
     }
 
     #[test]

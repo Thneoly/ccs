@@ -294,14 +294,58 @@ fn teardown() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Shared with main.rs's plain listing so truncation cannot drift between
-/// the two views.
+/// the two views. Cuts by DISPLAY width — a CJK char occupies two columns
+/// and a char-counted cut left Chinese topics running far past the column
+/// (the corpus median topic is 200 display columns wide).
 pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max).collect();
-        format!("{cut}…")
+    if display_width(s) <= max {
+        return s.to_string();
     }
+    let mut cut = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = char_width(c);
+        if w + cw > max.saturating_sub(1) {
+            break;
+        }
+        cut.push(c);
+        w += cw;
+    }
+    format!("{cut}…")
+}
+
+/// Terminal cell count of a char: East-Asian Wide/Fullwidth and emoji
+/// blocks take two columns, everything else one. A pragmatic East-Asian
+/// subset (no unicode-width dep) — good enough to keep columns honest.
+/// Pure — pinned by tests.
+pub(crate) fn char_width(c: char) -> usize {
+    let u = c as u32;
+    if matches!(u,
+        0x1100..=0x115F          // Hangul Jamo
+        | 0x2E80..=0x303E         // CJK Radicals .. CJK Symbols
+        | 0x3041..=0x33FF         // Kana .. CJK Compat
+        | 0x3400..=0x4DBF         // CJK Ext A
+        | 0x4E00..=0x9FFF         // CJK Unified
+        | 0xA000..=0xA4CF         // Yi
+        | 0xAC00..=0xD7A3         // Hangul Syllables
+        | 0xF900..=0xFAFF         // CJK Compat Ideographs
+        | 0xFE30..=0xFE4F         // CJK Compat Forms
+        | 0xFF00..=0xFF60         // Fullwidth Forms
+        | 0xFFE0..=0xFFE6
+        | 0x1F300..=0x1F64F       // emoji
+        | 0x1F900..=0x1F9FF
+        | 0x20000..=0x2FFFD       // CJK Ext B..
+        | 0x30000..=0x3FFFD
+    ) {
+        2
+    } else {
+        1
+    }
+}
+
+/// Total display width of a string. Pure — pinned by tests.
+pub(crate) fn display_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
 }
 
 pub(crate) fn squash(s: &str) -> String {
@@ -340,6 +384,18 @@ mod tests {
         assert!(matches_filter(&r, "d:/project"));
         assert!(matches_filter(&r, "D:\\Project"));
         assert!(matches_filter(&r, "project/ccm"));
+    }
+
+    #[test]
+    fn truncation_counts_display_width_not_chars() {
+        // 8 CJK chars = 16 columns: a 10-wide cut keeps 4 chars + ellipsis
+        assert_eq!(truncate_chars("一二三四五六七八", 10), "一二三四…");
+        assert_eq!(truncate_chars("一二三四", 10), "一二三四");
+        // ASCII is unaffected
+        assert_eq!(truncate_chars("abcdef", 4), "abc…");
+        assert_eq!(display_width("你好ab"), 6);
+        assert_eq!(display_width("🎬"), 2); // emoji occupies two cells
+        assert_eq!(display_width("a"), 1);
     }
 
     #[test]
