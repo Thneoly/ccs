@@ -53,6 +53,24 @@ pub fn clamp_sel(sel: usize, len: usize) -> usize {
     if len == 0 { 0 } else { sel.min(len - 1) }
 }
 
+/// True when a Char key with these modifiers still means "the user typed
+/// this character": SHIFT alone passes (it is how uppercase arrives —
+/// Shift+A is `Char('A')` + SHIFT; caps-lock uppercase arrives with no
+/// modifiers at all), but any Ctrl/Alt/Super/Meta combo must not inject a
+/// bare letter into the filter. Known gap, unchanged from before: on
+/// layouts needing AltGr for common characters, Windows delivers them as
+/// CONTROL|ALT and they are dropped too. Pure — pinned by tests.
+pub fn typeable_modifiers(m: KeyModifiers) -> bool {
+    m.intersection(
+        KeyModifiers::CONTROL
+            | KeyModifiers::ALT
+            | KeyModifiers::SUPER
+            | KeyModifiers::HYPER
+            | KeyModifiers::META,
+    )
+    .is_empty()
+}
+
 /// Run the picker on a TTY stdout. A piped stdout reports Failed so the
 /// caller can list plainly.
 pub fn run(rows: &[PickerRow], model: Option<&str>) -> Pick {
@@ -110,11 +128,13 @@ fn pick(terminal: &mut DefaultTerminal, rows: &[PickerRow], model: Option<&str>)
             Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Esc => return None,
                 // plain q quits only with an empty filter, so the letter
-                // stays typeable; Esc/Ctrl-C always abort
+                // stays typeable; Esc/Ctrl-C always abort. crossterm
+                // uppercases the char when caps-lock is on, so the abort
+                // arm must take both cases
                 KeyCode::Char('q') if key.modifiers.is_empty() && filter.is_empty() => {
                     return None;
                 }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return None;
                 }
                 KeyCode::Up => {
@@ -143,9 +163,10 @@ fn pick(terminal: &mut DefaultTerminal, rows: &[PickerRow], model: Option<&str>)
                         return Some(row_idx);
                     }
                 }
-                // unmodified typing only — Ctrl/Alt combos must not inject
-                // bare letters into the filter
-                KeyCode::Char(c) if key.modifiers.is_empty() => {
+                // plain typing only — Ctrl/Alt combos must not inject bare
+                // letters into the filter, but SHIFT passes so uppercase
+                // stays typeable (Shift+A arrives as Char('A') + SHIFT)
+                KeyCode::Char(c) if typeable_modifiers(key.modifiers) => {
                     filter.push(c);
                     filtered = refilter(rows, &filter);
                 }
@@ -301,5 +322,25 @@ mod tests {
         assert_eq!(clamp_sel(2, 3), 2);
         assert_eq!(clamp_sel(9, 3), 2);
         assert_eq!(clamp_sel(0, 0), 0); // caller guards empty separately
+    }
+
+    #[test]
+    fn shift_and_locks_type_but_ctrl_alt_combos_do_not() {
+        // Shift+A arrives as Char('A') + SHIFT — must type
+        assert!(typeable_modifiers(KeyModifiers::SHIFT));
+        assert!(typeable_modifiers(KeyModifiers::NONE));
+        // caps-lock uppercase arrives as a plain Char('A') with NONE —
+        // crossterm 0.29 carries no lock-state modifiers to admit here
+        // Ctrl/Alt combos must not inject their bare control char
+        assert!(!typeable_modifiers(KeyModifiers::CONTROL));
+        assert!(!typeable_modifiers(KeyModifiers::ALT));
+        assert!(!typeable_modifiers(KeyModifiers::SUPER));
+        assert!(!typeable_modifiers(KeyModifiers::META));
+        assert!(!typeable_modifiers(
+            KeyModifiers::SHIFT | KeyModifiers::CONTROL
+        ));
+        assert!(!typeable_modifiers(
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ));
     }
 }
