@@ -22,6 +22,11 @@
 //                        (hex-id worktree/task dirs) the default views
 //                        skip, so an agent storm cannot crowd real
 //                        projects out of the newest-sessions view
+//   ccs --since 7d       only sessions modified within the span (12h/7d/2w);
+//                        works in every mode
+//   picker extras        '/' searches message content (background scan,
+//                        terms ANDed); Tab toggles an end-of-session
+//                        preview (last input/reply, branch at end)
 //   ccs <keyword>        filter across the newest max(n,500) transcripts;
 //                        matches count only in conversation text (user /
 //                        assistant messages), any case
@@ -84,6 +89,7 @@ fn run(args: &[String]) -> i32 {
     let mut model: Option<String> = None;
     let mut no_tui = false;
     let mut all = false;
+    let mut since: Option<u64> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut sub_idx: Option<usize> = None;
     let mut i = 0;
@@ -116,6 +122,16 @@ fn run(args: &[String]) -> i32 {
             }
             "--no-tui" => no_tui = true,
             "-a" | "--all" => all = true,
+            "--since" => {
+                i += 1;
+                match args.get(i).and_then(|v| parse_since(v)) {
+                    Some(s) => since = Some(s),
+                    None => {
+                        eprintln!("ccs: --since expects a span like 12h, 7d, 2w");
+                        return 2;
+                    }
+                }
+            }
             "-h" | "--help" | "help" => {
                 print_usage();
                 return 0;
@@ -207,6 +223,12 @@ fn run(args: &[String]) -> i32 {
     let cap = if interactive { n.max(200) } else { n };
     let hide_generated = keyword.is_none() && !all;
     let temp_root = env::temp_dir().to_string_lossy().into_owned();
+    // clamp the span into i64 first: a saturating u64 span would wrap
+    // negative `as i64` and invert the filter into "show nothing"
+    let min_secs = since
+        .map(|span| i64::try_from(span).unwrap_or(i64::MAX))
+        .and_then(|span| chrono::Local::now().timestamp().checked_sub(span))
+        .map(|t| t.max(0) as u64);
 
     let mut entries: Vec<picker::PickerRow> = Vec::new();
     // keyword-mode match context lines, parallel to entries (empty elsewhere)
@@ -215,6 +237,9 @@ fn run(args: &[String]) -> i32 {
     if let Some(kw) = &keyword {
         let needle = kw.to_lowercase();
         for (path, secs) in files.iter().take(n.max(500)) {
+            if min_secs.is_some_and(|m| *secs < m) {
+                continue;
+            }
             let row = row_for(path, *secs);
             // generated workspaces leave the scan window unless --all:
             // they match their own harness boilerplate and would eat the
@@ -254,6 +279,9 @@ fn run(args: &[String]) -> i32 {
         for (path, secs) in files.iter() {
             if entries.len() >= cap {
                 break;
+            }
+            if min_secs.is_some_and(|m| *secs < m) {
+                continue;
             }
             let row = row_for(path, *secs);
             if hide_generated && is_generated_workspace(&row.cwd, &temp_root) {
@@ -311,7 +339,7 @@ fn run(args: &[String]) -> i32 {
         let proj = picker::truncate_chars(&r.cwd.replace('\\', "/"), 38);
         let topic = picker::truncate_chars(&picker::squash(&r.topic), 56);
         out(&format!(
-            "{:>3} {} {}  {:<38}  {}",
+            "{:>3} {:<11} {}  {:<38}  {}",
             idx + 1,
             r.time,
             mark,
@@ -325,7 +353,7 @@ fn run(args: &[String]) -> i32 {
             && !s.is_empty()
             && !keyword
                 .as_ref()
-                .is_some_and(|k| r.topic.to_lowercase().contains(&k.to_lowercase()))
+                .is_some_and(|k| topic.to_lowercase().contains(&k.to_lowercase()))
         {
             out(&format!("      └ {s}"));
         }
@@ -486,6 +514,20 @@ fn sessions_root() -> Option<PathBuf> {
     Some(home.join(".claude").join("projects"))
 }
 
+/// True for the known harness wrappers (command output / caveats /
+/// continuation boilerplate) that never describe what a session is about
+/// and must never be presented as a user's words. A genuine prompt that
+/// merely starts with '<' (pasted HTML) stays a topic/hit. Pure —
+/// pinned by tests.
+fn is_wrapper(t: &str) -> bool {
+    t.starts_with("<local-command-caveat")
+        || t.starts_with("<local-command-stdout")
+        || t.starts_with("<command-")
+        || t.starts_with("Caveat: The messages")
+        || t.starts_with("[Request interrupted")
+        || t.starts_with("This session is being continued")
+}
+
 /// Signals collected from a transcript's head records (~200 lines):
 /// cwd, the model-written session title (`ai-title`, recent CC versions
 /// only), the first non-wrapper user text, and the first assistant text
@@ -543,15 +585,7 @@ fn head_info(path: &std::path::Path) -> HeadInfo {
             && let Some(text) = user_text(msg)
         {
             let t = text.trim();
-            // skip the known harness wrappers ONLY — a genuine prompt
-            // that merely starts with '<' (pasted HTML) stays a topic
-            let wrapper = t.starts_with("<local-command-caveat")
-                || t.starts_with("<local-command-stdout")
-                || t.starts_with("<command-")
-                || t.starts_with("Caveat: The messages")
-                || t.starts_with("[Request interrupted")
-                || t.starts_with("This session is being continued");
-            if !t.is_empty() && !wrapper {
+            if !t.is_empty() && !is_wrapper(t) {
                 info.user_topic = Some(t.to_string());
             }
         }
@@ -611,12 +645,10 @@ fn last_prompt_from_lines<'a>(lines: impl DoubleEndedIterator<Item = &'a str>) -
     None
 }
 
-/// Bounded tail read: last 128KB of the transcript, first line dropped
-/// (likely partial — single lines can exceed the window), then the last
-/// `last-prompt` within it. All 216 top-level transcripts on the author's
-/// machine hold theirs inside this window; a miss falls back up the
-/// choose_topic chain.
-fn tail_last_prompt(path: &std::path::Path) -> Option<String> {
+/// Bounded tail read: the last 128KB of the transcript as whole lines
+/// (first line dropped — it is likely partial; single records can exceed
+/// the window). Shared by the last-prompt fallback and the preview pane.
+fn read_tail(path: &std::path::Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
@@ -624,12 +656,19 @@ fn tail_last_prompt(path: &std::path::Path) -> Option<String> {
     f.seek(SeekFrom::Start(start)).ok()?;
     let mut buf = vec![0u8; (len - start) as usize];
     f.read_exact(&mut buf).ok()?;
-    let tail = String::from_utf8_lossy(&buf);
+    let tail = String::from_utf8_lossy(&buf).to_string();
     let mut lines = tail.split('\n');
     if start > 0 {
         lines.next(); // drop the partial line
     }
-    last_prompt_from_lines(lines)
+    Some(lines.collect::<Vec<_>>().join("\n"))
+}
+
+/// The last `last-prompt` within a whole-line tail. All 216 top-level
+/// transcripts on the author's machine hold theirs inside the window; a
+/// miss falls back up the choose_topic chain.
+fn tail_last_prompt(path: &std::path::Path) -> Option<String> {
+    last_prompt_from_lines(read_tail(path)?.split('\n'))
 }
 
 fn user_text(msg: Option<&serde_json::Value>) -> Option<String> {
@@ -683,11 +722,23 @@ fn encoded_fallback(path: &std::path::Path) -> String {
 /// tests.
 fn snippet_around(text: &str, needle: &str, budget: usize) -> String {
     let flat = picker::squash(text);
-    let Some(pos) = flat.to_lowercase().find(needle) else {
+    let chars: Vec<char> = flat.chars().collect();
+    // lowercase per char with an index map: a byte offset found in the
+    // LOWERCASED whole string is not a boundary in the original when a
+    // char case-folds to a different length (İ, ß) — map low char
+    // positions back to flat char positions instead
+    let mut low = String::new();
+    let mut map: Vec<usize> = Vec::new(); // map[low char idx] = flat char idx
+    for (i, &c) in chars.iter().enumerate() {
+        for _ in c.to_lowercase() {
+            map.push(i);
+        }
+        low.extend(c.to_lowercase());
+    }
+    let Some(pos) = low.find(needle) else {
         return String::new();
     };
-    let chars: Vec<char> = flat.chars().collect();
-    let hit_cp = flat[..pos].chars().count();
+    let hit_cp = map[low[..pos].chars().count()];
     let needle_cp = needle.chars().count();
     let needle_w = picker::display_width(needle);
     // width each side may spend so needle + context + ellipses fit
@@ -726,12 +777,151 @@ fn snippet_around(text: &str, needle: &str, budget: usize) -> String {
         window.push('…');
     }
     window.push_str(&left);
-    window.extend(&chars[hit_cp..hit_cp + needle_cp]);
+    window.extend(&chars[hit_cp..(hit_cp + needle_cp).min(chars.len())]);
     window.push_str(&right);
     if cut_end {
         window.push('…');
     }
     window
+}
+
+/// What the preview pane shows about a session's end: the last user
+/// input, the last assistant reply, the branch at end (gitBranch changes
+/// mid-session — this is where it ended), and the last-seen timestamp.
+#[derive(Default, Debug, PartialEq)]
+pub(crate) struct TailInfo {
+    pub last_user: Option<String>,
+    pub last_assistant: Option<String>,
+    pub branch: Option<String>,
+    pub last_seen: Option<String>,
+}
+
+/// Walk tail lines BACKWARD filling TailInfo — the first hit of each
+/// field scanning from the end is its final value (records append
+/// chronologically). Pure — pinned by tests.
+fn tail_info_from_lines<'a>(lines: impl DoubleEndedIterator<Item = &'a str>) -> TailInfo {
+    let mut info = TailInfo::default();
+    for line in lines.rev() {
+        let wants_any = info.last_user.is_none()
+            || info.last_assistant.is_none()
+            || info.branch.is_none()
+            || info.last_seen.is_none();
+        if !wants_any {
+            break;
+        }
+        if !line.contains("\"message\"")
+            && !line.contains("\"gitBranch\"")
+            && !line.contains("\"timestamp\"")
+        {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("isSidechain").and_then(|s| s.as_bool()) == Some(true)
+            || v.get("isMeta").and_then(|s| s.as_bool()) == Some(true)
+        {
+            continue;
+        }
+        if let Some(ts) = v.get("timestamp").and_then(|t| t.as_str())
+            && info.last_seen.is_none()
+        {
+            info.last_seen = Some(ts.to_string());
+        }
+        if let Some(b) = v.get("gitBranch").and_then(|t| t.as_str())
+            && info.branch.is_none()
+        {
+            info.branch = Some(b.to_string());
+        }
+        let role = v
+            .get("message")
+            .and_then(|m| m.get("role"))
+            .and_then(|r| r.as_str());
+        if role == Some("user")
+            && info.last_user.is_none()
+            && let Some(text) = user_text(v.get("message"))
+            && !text.trim().is_empty()
+            && !is_wrapper(text.trim())
+        {
+            info.last_user = Some(text.trim().to_string());
+        }
+        if role == Some("assistant")
+            && info.last_assistant.is_none()
+            && let Some(text) = user_text(v.get("message"))
+            && !text.trim().is_empty()
+        {
+            info.last_assistant = Some(text.trim().to_string());
+        }
+    }
+    info
+}
+
+/// Preview lines for the picker's Tab pane: where the session ENDED —
+/// often the actual memory hook when the topic is a generic opening.
+pub(crate) fn preview_lines(path: &std::path::Path) -> Vec<String> {
+    let info = read_tail(path)
+        .map(|t| tail_info_from_lines(t.split('\n')))
+        .unwrap_or_default();
+    let mut lines = Vec::new();
+    if let Some(u) = &info.last_user {
+        lines.push(format!(
+            "你: {}",
+            picker::truncate_chars(&picker::squash(u), 72)
+        ));
+    }
+    if let Some(a) = &info.last_assistant {
+        lines.push(format!(
+            "ai: {}",
+            picker::truncate_chars(&picker::squash(a), 72)
+        ));
+    }
+    let meta = [
+        info.branch.as_deref().map(|b| format!("branch {b}")),
+        info.last_seen
+            .as_deref()
+            .and_then(parse_iso_min)
+            .map(|s| format!("last {s}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ");
+    if !meta.is_empty() {
+        lines.push(meta);
+    }
+    if lines.is_empty() {
+        lines.push("(no conversation tail in the last 128KB)".to_string());
+    }
+    lines
+}
+
+/// ISO timestamp -> "MM-DD HH:mm" for the preview meta line; the raw
+/// string back on any parse failure.
+fn parse_iso_min(iso: &str) -> Option<String> {
+    chrono::DateTime::parse_from_rfc3339(iso).ok().map(|d| {
+        d.with_timezone(&chrono::Local)
+            .format("%m-%d %H:%M")
+            .to_string()
+    })
+}
+
+/// True when the transcript's conversation text contains EVERY term
+/// (AND, case-insensitive, machine context excluded — same domain as
+/// human_text_hit). Used by the picker's `/` content search; runs on a
+/// background thread. Reads the file once.
+pub(crate) fn conversation_matches(path: &std::path::Path, terms: &[String]) -> bool {
+    if terms.is_empty() {
+        return false;
+    }
+    let Ok(raw) = fs::read(path) else {
+        return false;
+    };
+    let raw_s = String::from_utf8_lossy(&raw);
+    let raw_l = raw_s.to_lowercase();
+    if !terms.iter().all(|t| raw_l.contains(t.as_str())) {
+        return false; // C-speed prefilter for the whole AND set
+    }
+    terms.iter().all(|t| human_text_hit(&raw_s, t).is_some())
 }
 
 /// A keyword hit inside human-visible conversation text.
@@ -776,6 +966,9 @@ fn human_text_hit(raw: &str, needle: &str) -> Option<TextHit> {
         let Some(text) = user_text(Some(msg)) else {
             continue;
         };
+        if role == "user" && is_wrapper(text.trim()) {
+            continue; // command output injected as a user record
+        }
         if !text.to_lowercase().contains(needle) {
             continue;
         }
@@ -814,6 +1007,7 @@ fn row_for(path: &std::path::Path, secs: u64) -> picker::PickerRow {
         reliable,
         topic: choose_topic(&head, tail_prompt.as_deref()).unwrap_or_default(),
         time: format_mtime(secs),
+        path: path.to_path_buf(),
     }
 }
 
@@ -855,13 +1049,42 @@ fn is_under(cwd: &str, root: &str) -> bool {
 }
 
 /// Local time is what a human compares against their terminal history;
-/// chrono::Local keeps that honest across DST and timezones.
+/// chrono::Local keeps that honest across DST and timezones. Rows from a
+/// previous year swap the clock for the year — "MM-DD HH:mm" is
+/// year-ambiguous on anything older than ~11 months.
 fn format_mtime(secs: u64) -> String {
-    chrono::DateTime::<chrono::Local>::from(
+    mtime_display(secs, chrono::Local::now().timestamp().max(0) as u64)
+}
+
+/// Pure rendering core of format_mtime — pinned by tests.
+fn mtime_display(secs: u64, now_secs: u64) -> String {
+    let dt = chrono::DateTime::<chrono::Local>::from(
         std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
-    )
-    .format("%m-%d %H:%M")
-    .to_string()
+    );
+    let now = chrono::DateTime::<chrono::Local>::from(
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(now_secs),
+    );
+    if dt.format("%Y").to_string() != now.format("%Y").to_string() {
+        dt.format("%y-%m-%d").to_string()
+    } else {
+        dt.format("%m-%d %H:%M").to_string()
+    }
+}
+
+/// "7d" / "12h" / "2w" -> seconds for the --since filter. Char-based
+/// (never split_at on a byte length — a multibyte unit like `天` would
+/// not be a char boundary and would panic). Pure — pinned by tests.
+fn parse_since(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let mut chars = s.chars();
+    let unit = chars.next_back()?;
+    let n: u64 = chars.as_str().parse().ok()?;
+    match unit {
+        'h' => Some(n.saturating_mul(3600)),
+        'd' => Some(n.saturating_mul(86400)),
+        'w' => Some(n.saturating_mul(7 * 86400)),
+        _ => None,
+    }
 }
 
 fn print_usage() {
@@ -874,6 +1097,8 @@ USAGE
                         resumes in the session's original directory)
   ccs -m glm            picker with the ccm route preset (Enter routes)
   ccs --no-tui          force the plain listing on a terminal
+  ccs --since 7d        only sessions modified within the span (12h/7d/2w),
+                        in every mode
   ccs -n 40             list 40 when non-interactive; on a terminal only
                         grows the picker pool past its 200-row floor
   ccs -a, --all         include the machine-generated agent workspaces
@@ -890,6 +1115,10 @@ USAGE
   ccs id <n>            print \"id<TAB>cwd\" for scripting
 
 NOTES
+  Picker keys: '/' searches message content (terms ANDed, conversation
+  text only, background scan); Tab toggles an end-of-session preview
+  (last input / last reply / branch at end / last activity); Esc leaves
+  the content query first, quits second.
   Bare ccs on a PIPE stays a plain listing (head/grep friendly). Sessions
   are read from ~/.claude/projects (never modified). open/id resolve
   against the machine-wide LAST listing - re-run ccs first if you listed
@@ -1019,6 +1248,113 @@ mod tests {
         let s = snippet_around("甲乙丙丁deploy戊己庚辛", "deploy", 12);
         assert!(crate::picker::display_width(&s) <= 12);
         assert!(s.contains("deploy"));
+    }
+
+    #[test]
+    fn since_spans_parse() {
+        use super::parse_since;
+        assert_eq!(parse_since("7d"), Some(7 * 86400));
+        assert_eq!(parse_since("12h"), Some(12 * 3600));
+        assert_eq!(parse_since("2w"), Some(14 * 86400));
+        assert_eq!(parse_since("0h"), Some(0));
+        assert_eq!(parse_since("7x"), None);
+        assert_eq!(parse_since("d"), None);
+        assert_eq!(parse_since(""), None);
+        assert_eq!(parse_since("-3d"), None);
+        // multibyte unit chars are not byte-boundary panics, just spans
+        // we do not understand
+        assert_eq!(parse_since("7天"), None);
+        assert_eq!(parse_since("3µd"), None);
+    }
+
+    #[test]
+    fn snippet_survives_case_folding_length_changes() {
+        use super::snippet_around;
+        // 'İ' lowercases to TWO chars; a byte offset taken from the
+        // lowercased string would slice mid-char in the original
+        let s = snippet_around("İxdeploy 关于部署", "deploy", 20);
+        assert!(s.contains("deploy"));
+        // the hit position still maps back through the fold
+        let s = snippet_around("aßİ deploy 件事", "deploy", 20);
+        assert!(s.contains("deploy"));
+    }
+
+    #[test]
+    fn wrappers_never_pose_as_user_words() {
+        use super::{human_text_hit, is_wrapper};
+        assert!(is_wrapper("<command-name>/effort</command-name>"));
+        assert!(is_wrapper("<local-command-stdout>1"));
+        assert!(is_wrapper("Caveat: The messages below"));
+        assert!(!is_wrapper("<pasted HTML the user actually sent>"));
+        assert!(!is_wrapper("普通的问题"));
+        // a keyword hitting only a command wrapper is not a conversation
+        // match — the user never typed it
+        let raw = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"<command-name>/effort设置</command-name>\"}}";
+        assert_eq!(human_text_hit(raw, "effort"), None);
+    }
+
+    #[test]
+    fn cross_year_rows_swap_the_clock_for_the_year() {
+        use super::mtime_display;
+        let now = 1_735_689_600_u64; // 2025-01-01Z
+        let old = now - 400 * 86400; // safely a previous year in any tz
+        assert_eq!(mtime_display(now, now).len(), 11); // "MM-DD HH:mm"
+        assert_eq!(mtime_display(old, now).len(), 8); // "YY-MM-DD"
+    }
+
+    #[test]
+    fn tail_info_reads_the_session_end() {
+        use super::tail_info_from_lines;
+        let mk_user = |t: &str| {
+            format!("{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"{t}\"}}}}")
+        };
+        let mk_ai = |t: &str| {
+            format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{t}\"}}]}}}}"
+            )
+        };
+        let sys = |b: &str, ts: &str| {
+            format!("{{\"type\":\"system\",\"gitBranch\":\"{b}\",\"timestamp\":\"{ts}\"}}")
+        };
+        // reverse walk: latest of each field wins; sidechain/meta skipped
+        let lines = vec![
+            sys("main", "2026-11-01T10:00:00Z"),
+            mk_user("第一个问题"),
+            mk_ai("第一版答复"),
+            mk_user("最后的问题"),
+            "{\"type\":\"user\",\"isSidechain\":true,\"message\":{\"role\":\"user\",\"content\":\"sidechain 不算\"}}".to_string(),
+            mk_ai("最终答复"),
+            sys("feat/findability", "2026-11-01T12:00:00Z"),
+        ];
+        let info = tail_info_from_lines(lines.iter().map(|s| s.as_str()));
+        assert_eq!(info.last_user.as_deref(), Some("最后的问题"));
+        assert_eq!(info.last_assistant.as_deref(), Some("最终答复"));
+        assert_eq!(info.branch.as_deref(), Some("feat/findability"));
+        assert_eq!(info.last_seen.as_deref(), Some("2026-11-01T12:00:00Z"));
+    }
+
+    #[test]
+    fn conversation_and_matching_reads_real_files() {
+        use super::conversation_matches;
+        let dir = std::env::temp_dir().join("ccs-test-and-match");
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("s.jsonl");
+        std::fs::write(
+            &f,
+            concat!(
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"把 Deploy 脚本改掉\"}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n",
+                "{\"type\":\"attachment\",\"attachment\":{\"text\":\"deploy listing noise\"}}\n",
+            ),
+        )
+        .unwrap();
+        // AND across terms, case-insensitive, conversation text only
+        assert!(conversation_matches(&f, &["deploy".into(), "脚本".into()]));
+        assert!(conversation_matches(&f, &["done".into()]));
+        // a term only present in an attachment record must not match
+        assert!(!conversation_matches(&f, &["listing".into()]));
+        assert!(!conversation_matches(&f, &[]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

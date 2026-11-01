@@ -12,6 +12,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table, TableState};
+use std::time::Duration;
 
 /// One selectable session row. Built by main's scan; the picker owns it
 /// for the duration of the interaction.
@@ -20,8 +21,10 @@ pub struct PickerRow {
     pub cwd: String,
     pub reliable: bool,
     pub topic: String,
-    /// preformatted "MM-DD HH:mm" (local) — date math stays in the scan
+    /// preformatted time (the year is prepended for cross-year rows)
     pub time: String,
+    /// transcript source path — the preview pane reads it on demand
+    pub path: std::path::PathBuf,
 }
 
 /// What the picker decided.
@@ -120,7 +123,32 @@ fn pick(
     hidden: usize,
 ) -> Option<usize> {
     let mut filter = String::new();
-    let mut filtered = refilter(rows, &filter);
+    // '/' content search: the query, plus background-scan state (the
+    // picker is a single-threaded loop; the scan runs on a thread and its
+    // result arrives through the channel, latest generation wins)
+    let mut content_mode = false;
+    let mut content_query = String::new();
+    let mut content_hits: Option<Vec<usize>> = None;
+    let mut scanning = false;
+    let mut scan_gen = 0u64;
+    let (scan_tx, scan_rx) = std::sync::mpsc::channel::<(u64, Vec<usize>)>();
+    // Tab preview of the selected row, recomputed when the row changes
+    let mut preview_on = false;
+    let mut preview: Option<(usize, Vec<String>)> = None;
+
+    // the metadata filter applies on top of whatever base set the content
+    // search produced (all rows when it never ran)
+    let apply = |filter: &str, base: &Option<Vec<usize>>| -> Vec<usize> {
+        match base {
+            Some(hits) => hits
+                .iter()
+                .copied()
+                .filter(|&i| matches_filter(&rows[i], filter))
+                .collect(),
+            None => refilter(rows, filter),
+        }
+    };
+    let mut filtered = apply(&filter, &content_hits);
     // The TableState lives HERE (not in the render fn) so its scroll
     // offset survives frames — ratatui's own state.rs contract.
     let mut state = TableState::default().with_selected(0);
@@ -128,66 +156,176 @@ fn pick(
         let sel = clamp_sel(state.selected().unwrap_or(0), filtered.len());
         state.select(Some(sel));
 
+        // the preview follows the selection: a 128KB tail read is a few
+        // milliseconds, fine on the UI thread
+        if preview_on {
+            if let Some(&row_idx) = filtered.get(sel)
+                && preview.as_ref().map(|(i, _)| *i) != Some(row_idx)
+            {
+                preview = Some((row_idx, crate::preview_lines(&rows[row_idx].path)));
+            }
+        } else {
+            preview = None;
+        }
+
         terminal
-            .draw(|frame| draw(frame, rows, &filtered, &mut state, &filter, model, hidden))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    rows,
+                    &filtered,
+                    &mut state,
+                    &filter,
+                    model,
+                    hidden,
+                    content_mode,
+                    &content_query,
+                    scanning,
+                    content_hits.as_ref().map(|h| h.len()),
+                    preview_on,
+                    preview.as_ref().map(|(_, l)| l),
+                )
+            })
             .ok()?;
 
-        // Windows emits TWO Key events per physical press (Press + Release);
-        // without this guard every key would act twice.
-        match event::read() {
-            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
-                KeyCode::Esc => return None,
-                // plain q quits only with an empty filter, so the letter
-                // stays typeable; Esc/Ctrl-C always abort. crossterm
-                // uppercases the char when caps-lock is on, so the abort
-                // arm must take both cases
-                KeyCode::Char('q') if key.modifiers.is_empty() && filter.is_empty() => {
-                    return None;
-                }
-                KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return None;
-                }
-                KeyCode::Up => {
-                    state.select(Some(sel.saturating_sub(1)));
-                }
-                KeyCode::Down if !filtered.is_empty() => {
-                    state.select(Some(clamp_sel(sel + 1, filtered.len())));
-                }
-                KeyCode::PageUp => {
-                    let page = 10.min(sel);
-                    state.select(Some(sel - page));
-                }
-                KeyCode::PageDown if !filtered.is_empty() => {
-                    state.select(Some(clamp_sel(sel + 10, filtered.len())));
-                }
-                KeyCode::Home => state.select(Some(0)),
-                KeyCode::End if !filtered.is_empty() => {
-                    state.select(Some(filtered.len() - 1));
-                }
-                KeyCode::Backspace => {
-                    filter.pop();
-                    filtered = refilter(rows, &filter);
-                }
-                KeyCode::Enter => {
-                    if let Some(&row_idx) = filtered.get(sel) {
-                        return Some(row_idx);
+        // wait for a key but wake up regularly to collect scan results —
+        // this used to block on event::read() forever
+        // fast poll only while a scan can land; the preview has no
+        // async producer (selection changes interrupt poll instantly)
+        let timeout = if scanning { 80 } else { 250 };
+        if event::poll(Duration::from_millis(timeout)).unwrap_or(false) {
+            // Windows emits TWO Key events per physical press (Press +
+            // Release); without this guard every key would act twice.
+            if let Ok(Event::Key(key)) = event::read()
+                && key.kind == KeyEventKind::Press
+            {
+                match key.code {
+                    KeyCode::Esc => {
+                        if content_mode {
+                            // leave the query input, keep any results
+                            content_mode = false;
+                        } else {
+                            return None;
+                        }
                     }
+                    KeyCode::Tab => {
+                        preview_on = !preview_on;
+                        preview = None;
+                    }
+                    // '/' enters content search: the metadata filter can
+                    // only see id/cwd/topic, never message text
+                    KeyCode::Char('/') if !content_mode && typeable_modifiers(key.modifiers) => {
+                        // typeable_modifiers, not is_empty: on layouts
+                        // where '/' needs Shift, the press arrives with
+                        // SHIFT set
+                        content_mode = true;
+                    }
+                    // Enter in content mode re-scans (terms are the
+                    // whitespace-split query, ANDed)
+                    KeyCode::Enter if content_mode => {
+                        // Enter on an EMPTY query is the "clear" gesture:
+                        // back to the full list, not a scan that matches
+                        // nothing and bricks the picker
+                        if content_query.trim().is_empty() {
+                            content_mode = false;
+                            content_hits = None;
+                            state.select(Some(0));
+                            // filtered re-applies after the match, like
+                            // every other edit
+                        } else {
+                            scan_gen += 1;
+                            scanning = true;
+                            let paths: Vec<std::path::PathBuf> =
+                                rows.iter().map(|r| r.path.clone()).collect();
+                            let terms: Vec<String> = content_query
+                                .to_lowercase()
+                                .split_whitespace()
+                                .map(String::from)
+                                .collect();
+                            let generation = scan_gen;
+                            let tx = scan_tx.clone();
+                            std::thread::spawn(move || {
+                                let hits: Vec<usize> = paths
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, p)| crate::conversation_matches(p, &terms))
+                                    .map(|(i, _)| i)
+                                    .collect();
+                                let _ = tx.send((generation, hits));
+                            });
+                        }
+                    }
+                    KeyCode::Backspace if content_mode => {
+                        content_query.pop();
+                    }
+                    KeyCode::Char(c) if content_mode && typeable_modifiers(key.modifiers) => {
+                        content_query.push(c);
+                    }
+                    // plain q quits only with an empty filter, so the letter
+                    // stays typeable; Esc/Ctrl-C always abort. crossterm
+                    // uppercases the char when caps-lock is on, so the abort
+                    // arm must take both cases
+                    KeyCode::Char('q')
+                        if !content_mode && key.modifiers.is_empty() && filter.is_empty() =>
+                    {
+                        return None;
+                    }
+                    KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return None;
+                    }
+                    KeyCode::Up => {
+                        state.select(Some(sel.saturating_sub(1)));
+                    }
+                    KeyCode::Down if !filtered.is_empty() => {
+                        state.select(Some(clamp_sel(sel + 1, filtered.len())));
+                    }
+                    KeyCode::PageUp => {
+                        let page = 10.min(sel);
+                        state.select(Some(sel - page));
+                    }
+                    KeyCode::PageDown if !filtered.is_empty() => {
+                        state.select(Some(clamp_sel(sel + 10, filtered.len())));
+                    }
+                    KeyCode::Home => state.select(Some(0)),
+                    KeyCode::End if !filtered.is_empty() => {
+                        state.select(Some(filtered.len() - 1));
+                    }
+                    KeyCode::Backspace => {
+                        filter.pop();
+                    }
+                    KeyCode::Enter => {
+                        if let Some(&row_idx) = filtered.get(sel) {
+                            return Some(row_idx);
+                        }
+                    }
+                    // plain typing only — Ctrl/Alt combos must not inject bare
+                    // letters into the filter, but SHIFT passes so uppercase
+                    // stays typeable (Shift+A arrives as Char('A') + SHIFT)
+                    KeyCode::Char(c) if typeable_modifiers(key.modifiers) => {
+                        filter.push(c);
+                    }
+                    _ => {}
                 }
-                // plain typing only — Ctrl/Alt combos must not inject bare
-                // letters into the filter, but SHIFT passes so uppercase
-                // stays typeable (Shift+A arrives as Char('A') + SHIFT)
-                KeyCode::Char(c) if typeable_modifiers(key.modifiers) => {
-                    filter.push(c);
-                    filtered = refilter(rows, &filter);
-                }
-                _ => {}
-            },
-            Ok(_) => {} // Release events, resize, mouse: redraw at loop top
-            Err(_) => return None,
+                // any edit re-filters over the current base set
+                filtered = apply(&filter, &content_hits);
+            }
+        }
+        // latest-wins: a slow older scan must not clobber a newer one
+        while let Ok((generation, hits)) = scan_rx.try_recv() {
+            if generation == scan_gen {
+                content_hits = Some(hits);
+                scanning = false;
+                // results are in: leave the input so Enter resumes the
+                // selection instead of silently rescanning
+                content_mode = false;
+                state.select(Some(0));
+                filtered = apply(&filter, &content_hits);
+            }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw(
     frame: &mut ratatui::Frame,
     rows: &[PickerRow],
@@ -196,13 +334,31 @@ fn draw(
     filter: &str,
     model: Option<&str>,
     hidden: usize,
+    content_mode: bool,
+    content_query: &str,
+    scanning: bool,
+    content_n: Option<usize>,
+    preview_on: bool,
+    preview: Option<&Vec<String>>,
 ) {
-    let [header, table_area, footer] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
+    let (header, table_area, preview_area, footer) = if preview_on {
+        let [h, t, p, f] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(5),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+        (h, t, Some(p), f)
+    } else {
+        let [h, t, f] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+        (h, t, None, f)
+    };
 
     let shown = if filtered.is_empty() {
         " · no matches".to_string()
@@ -214,14 +370,28 @@ fn draw(
     } else {
         String::new()
     };
+    let content = match (content_n, scanning) {
+        (_, true) => " · scanning…".to_string(),
+        (Some(n), false) if !content_mode => format!(" · {n} content hits"),
+        _ => String::new(),
+    };
     let route = model.map(|m| format!(" · ccm: {m}")).unwrap_or_default();
+    let (prompt_label, prompt_value) = if content_mode {
+        (" · content: ", content_query)
+    } else {
+        (" · filter: ", filter)
+    };
     let header_line = Line::from(vec![
         Span::styled(" ccs", Style::default().fg(Color::Cyan).bold()),
         Span::raw(shown),
+        Span::styled(content, Style::default().fg(Color::Cyan)),
         Span::styled(skipped, Style::default().fg(Color::DarkGray)),
         Span::raw(route),
-        Span::raw(" · filter: "),
-        Span::styled(format!("{filter}█"), Style::default().fg(Color::Yellow)),
+        Span::raw(prompt_label),
+        Span::styled(
+            format!("{prompt_value}█"),
+            Style::default().fg(Color::Yellow),
+        ),
     ]);
     frame.render_widget(Paragraph::new(header_line), header);
 
@@ -264,13 +434,30 @@ fn draw(
     .highlight_symbol("▶ ");
     frame.render_stateful_widget(table, table_area, state);
 
+    // the preview pane: where the session ended (last input, last reply,
+    // branch-at-end, last activity) — a bounded tail read per selection
+    if let (Some(area), Some(lines)) = (preview_area, preview) {
+        let text: Vec<Line> = lines
+            .iter()
+            .map(|l| Line::styled(l.clone(), Style::default().fg(Color::Gray)))
+            .collect();
+        frame.render_widget(
+            Paragraph::new(text).block(
+                ratatui::widgets::Block::bordered()
+                    .border_style(Style::default().fg(Color::DarkGray))
+                    .title(" end of session "),
+            ),
+            area,
+        );
+    }
+
     let enter_hint = match model {
         Some(m) => format!("Enter resume via ccm {m}"),
         None => "Enter resume".to_string(),
     };
     let footer_line = Line::from(vec![
         Span::styled(
-            " ↑↓ select · type filter · ⌫ edit · ",
+            " ↑↓ select · type filter · / content · Tab preview · ",
             Style::default().fg(Color::DarkGray),
         ),
         Span::styled(enter_hint, Style::default().fg(Color::Green)),
@@ -363,6 +550,7 @@ mod tests {
             reliable: true,
             topic: topic.into(),
             time: "10-13 21:00".into(),
+            path: std::path::PathBuf::from("x.jsonl"),
         }
     }
 
