@@ -448,51 +448,150 @@ fn sessions_root() -> Option<PathBuf> {
     Some(home.join(".claude").join("projects"))
 }
 
-/// cwd + topic from the first ~200 parsable records. The topic is the
-/// first user text that is not a harness wrapper (command output /
-/// caveats) — those never describe what the session is about.
-fn head_info(path: &std::path::Path) -> (Option<String>, String) {
+/// Signals collected from a transcript's head records (~200 lines):
+/// cwd, the model-written session title (`ai-title`, recent CC versions
+/// only), the first non-wrapper user text, and the first assistant text
+/// as a last-resort topic.
+struct HeadInfo {
+    cwd: Option<String>,
+    ai_title: Option<String>,
+    user_topic: Option<String>,
+    assistant_topic: Option<String>,
+}
+
+/// cwd + topic signals from the first ~200 parsable records. The user
+/// topic is the first user text that is not a harness wrapper (command
+/// output / caveats) — those never describe what the session is about.
+fn head_info(path: &std::path::Path) -> HeadInfo {
     let Ok(file) = fs::File::open(path) else {
-        return (None, "(unreadable)".to_string());
+        return HeadInfo {
+            cwd: None,
+            ai_title: None,
+            user_topic: Some("(unreadable)".to_string()),
+            assistant_topic: None,
+        };
     };
     let reader = BufReader::new(file);
-    let mut cwd = None;
-    let mut topic = String::new();
+    let mut info = HeadInfo {
+        cwd: None,
+        ai_title: None,
+        user_topic: None,
+        assistant_topic: None,
+    };
     // map_while(Ok) BEFORE take(): unreadable/non-UTF8 lines must not eat
     // the 200-record budget (flatten would loop forever on repeated Err)
     for line in reader.lines().map_while(Result::ok).take(200) {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
-        if cwd.is_none()
+        // ai-title lands ~line 18, AFTER the first user message — no
+        // early break until it is seen (or the budget runs out)
+        if info.ai_title.is_none()
+            && v.get("type").and_then(|t| t.as_str()) == Some("ai-title")
+            && let Some(t) = v.get("aiTitle").and_then(|t| t.as_str())
+            && !t.trim().is_empty()
+        {
+            info.ai_title = Some(t.to_string());
+        }
+        if info.cwd.is_none()
             && let Some(c) = v.get("cwd").and_then(|c| c.as_str())
         {
-            cwd = Some(c.to_string());
+            info.cwd = Some(c.to_string());
         }
-        if topic.is_empty() {
-            let msg = v.get("message");
-            let role = msg.and_then(|m| m.get("role")).and_then(|r| r.as_str());
-            if role == Some("user")
-                && let Some(text) = user_text(msg)
-            {
-                let t = text.trim();
-                // skip the known harness wrappers ONLY — a genuine prompt
-                // that merely starts with '<' (pasted HTML) stays a topic
-                let wrapper = t.starts_with("<local-command-caveat")
-                    || t.starts_with("<local-command-stdout")
-                    || t.starts_with("<command-")
-                    || t.starts_with("Caveat: The messages")
-                    || t.starts_with("[Request interrupted");
-                if !t.is_empty() && !wrapper {
-                    topic = t.to_string();
-                }
+        let msg = v.get("message");
+        let role = msg.and_then(|m| m.get("role")).and_then(|r| r.as_str());
+        if info.user_topic.is_none()
+            && role == Some("user")
+            && let Some(text) = user_text(msg)
+        {
+            let t = text.trim();
+            // skip the known harness wrappers ONLY — a genuine prompt
+            // that merely starts with '<' (pasted HTML) stays a topic
+            let wrapper = t.starts_with("<local-command-caveat")
+                || t.starts_with("<local-command-stdout")
+                || t.starts_with("<command-")
+                || t.starts_with("Caveat: The messages")
+                || t.starts_with("[Request interrupted")
+                || t.starts_with("This session is being continued");
+            if !t.is_empty() && !wrapper {
+                info.user_topic = Some(t.to_string());
             }
         }
-        if cwd.is_some() && !topic.is_empty() {
+        if info.assistant_topic.is_none()
+            && role == Some("assistant")
+            && let Some(text) = user_text(msg)
+        {
+            let t = text.trim();
+            if !t.is_empty() {
+                info.assistant_topic = Some(t.to_string());
+            }
+        }
+        if info.cwd.is_some() && info.ai_title.is_some() && info.user_topic.is_some() {
             break;
         }
     }
-    (cwd, topic)
+    info
+}
+
+/// Topic priority: the model-written title (★) beats the opening user
+/// message beats the session's LAST user input (≫, from a bounded tail
+/// read — "where it ended" is often the memory hook) beats the first
+/// assistant text. The markers keep the two title semantics from mixing
+/// silently. Pure — pinned by tests.
+fn choose_topic(head: &HeadInfo, tail_prompt: Option<&str>) -> Option<String> {
+    if let Some(t) = &head.ai_title {
+        return Some(format!("★ {t}"));
+    }
+    if let Some(t) = &head.user_topic {
+        return Some(t.clone());
+    }
+    if let Some(p) = tail_prompt {
+        return Some(format!("≫ {p}"));
+    }
+    head.assistant_topic.clone()
+}
+
+/// The final `last-prompt` record (the session's last user input), from a
+/// 128KB tail read. Records append chronologically, so the LAST one in
+/// file order is the first hit scanning backward. Pure core — pinned by
+/// tests.
+fn last_prompt_from_lines<'a>(lines: impl DoubleEndedIterator<Item = &'a str>) -> Option<String> {
+    for line in lines.rev() {
+        if !line.contains("\"last-prompt\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(p) = v.get("lastPrompt").and_then(|p| p.as_str()) {
+            let p = p.trim();
+            if !p.is_empty() {
+                return Some(p.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Bounded tail read: last 128KB of the transcript, first line dropped
+/// (likely partial — single lines can exceed the window), then the last
+/// `last-prompt` within it. All 216 top-level transcripts on the author's
+/// machine hold theirs inside this window; a miss falls back up the
+/// choose_topic chain.
+fn tail_last_prompt(path: &std::path::Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(128 * 1024);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = vec![0u8; (len - start) as usize];
+    f.read_exact(&mut buf).ok()?;
+    let tail = String::from_utf8_lossy(&buf);
+    let mut lines = tail.split('\n');
+    if start > 0 {
+        lines.next(); // drop the partial line
+    }
+    last_prompt_from_lines(lines)
 }
 
 fn user_text(msg: Option<&serde_json::Value>) -> Option<String> {
@@ -538,21 +637,27 @@ fn encoded_fallback(path: &std::path::Path) -> String {
 }
 
 /// One transcript file -> one picker row: id from the file stem, cwd and
-/// topic from the transcript head, mtime formatted for display.
+/// topic signals from the transcript head (plus a tail read only when
+/// the head yields no title at all), mtime formatted for display.
 fn row_for(path: &std::path::Path, secs: u64) -> picker::PickerRow {
     let id = path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("?")
         .to_string();
-    let info = head_info(path);
-    let reliable = info.0.is_some();
-    let cwd = info.0.unwrap_or_else(|| encoded_fallback(path));
+    let head = head_info(path);
+    let reliable = head.cwd.is_some();
+    let cwd = head.cwd.clone().unwrap_or_else(|| encoded_fallback(path));
+    let tail_prompt = if head.ai_title.is_none() && head.user_topic.is_none() {
+        tail_last_prompt(path)
+    } else {
+        None
+    };
     picker::PickerRow {
         id,
         cwd,
         reliable,
-        topic: info.1,
+        topic: choose_topic(&head, tail_prompt.as_deref()).unwrap_or_default(),
         time: format_mtime(secs),
     }
 }
@@ -633,6 +738,9 @@ NOTES
   against the machine-wide LAST listing - re-run ccs first if you listed
   with a different filter elsewhere. The ~ mark flags a cwd that was not
   on record (lossy directory-name decode); such rows cannot be opened.
+  Topics: ★ marks a model-written session title (ai-title), ≫ the
+  session's last user input (no opening line survived the wrapper
+  filter); plain rows show the first user message.
   Machine-generated agent workspaces (a path segment splitting into a
   bare hex fragment of 8+ chars containing a letter, e.g.
   .../call-10-31bc8a6e6e05/workdir worktrees; and anything under the OS
@@ -645,9 +753,73 @@ NOTES
 
 #[cfg(test)]
 mod tests {
-    use super::{is_generated_workspace, is_under};
+    use super::{choose_topic, is_generated_workspace, is_under, last_prompt_from_lines};
 
     const TMP: &str = "C:/Users/x/AppData/Local/Temp";
+
+    fn head(
+        ai_title: Option<&str>,
+        user_topic: Option<&str>,
+        assistant_topic: Option<&str>,
+    ) -> super::HeadInfo {
+        super::HeadInfo {
+            cwd: Some("D:/Project/ccs".into()),
+            ai_title: ai_title.map(String::from),
+            user_topic: user_topic.map(String::from),
+            assistant_topic: assistant_topic.map(String::from),
+        }
+    }
+
+    #[test]
+    fn topic_priority_ai_title_user_then_tail_then_assistant() {
+        // ai-title wins and gets the star marker
+        assert_eq!(
+            choose_topic(
+                &head(Some("修复输入"), Some("看下项目"), Some("好的")),
+                None
+            ),
+            Some("★ 修复输入".into())
+        );
+        // opening user message is the default, unmarked
+        assert_eq!(
+            choose_topic(&head(None, Some("看下项目"), Some("好的")), None),
+            Some("看下项目".into())
+        );
+        // no title in the head: the session's last input takes over, marked
+        assert_eq!(
+            choose_topic(&head(None, None, Some("好的")), Some("改成蓝绿部署")),
+            Some("≫ 改成蓝绿部署".into())
+        );
+        // tail prompt still beats assistant text (assistant is last resort)
+        assert_eq!(
+            choose_topic(&head(None, None, Some("我先看看")), Some("改成蓝绿部署")),
+            Some("≫ 改成蓝绿部署".into())
+        );
+        // nothing human anywhere: first assistant text, unmarked
+        assert_eq!(
+            choose_topic(&head(None, None, Some("我先看看")), None),
+            Some("我先看看".into())
+        );
+        assert_eq!(choose_topic(&head(None, None, None), None), None);
+    }
+
+    #[test]
+    fn last_prompt_takes_the_latest_record_from_the_tail() {
+        let mk = |p: &str| format!("{{\"type\":\"last-prompt\",\"lastPrompt\":\"{p}\"}}");
+        let find = |v: &[String]| last_prompt_from_lines(v.iter().map(|s| s.as_str()));
+        // scanning backward: the newest (last) prompt wins
+        let lines = vec![
+            mk("第一个"),
+            mk("第二个"),
+            "{\"type\":\"mode\"}".to_string(),
+        ];
+        assert_eq!(find(&lines), Some("第二个".into()));
+        // empty prompts are skipped, not returned
+        let lines = vec![mk("  "), mk("有效")];
+        assert_eq!(find(&lines), Some("有效".into()));
+        // nothing there
+        assert_eq!(find(&["{\"type\":\"user\"}".to_string()]), None);
+    }
 
     #[test]
     fn hex_id_segments_flag_generated_workspaces() {
