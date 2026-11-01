@@ -36,14 +36,17 @@ pub enum Pick {
 }
 
 /// True when the row matches the live filter: substring over id, cwd, and
-/// topic, case-insensitive. Pure — pinned by tests.
+/// topic, case-insensitive. The cwd is matched with separators normalized
+/// to `/` — the table DISPLAYS forward slashes, so what you see must be
+/// what you can type (the raw record cwd carries backslashes on Windows).
+/// Pure — pinned by tests.
 pub fn matches_filter(row: &PickerRow, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
-    let needle = needle.to_lowercase();
+    let needle = needle.to_lowercase().replace('\\', "/");
     row.id.to_lowercase().contains(&needle)
-        || row.cwd.to_lowercase().contains(&needle)
+        || row.cwd.replace('\\', "/").to_lowercase().contains(&needle)
         || row.topic.to_lowercase().contains(&needle)
 }
 
@@ -328,6 +331,15 @@ mod tests {
         assert!(matches_filter(&r, "路由"));
         assert!(matches_filter(&r, "abc123"));
         assert!(!matches_filter(&r, "zzz"));
+    }
+
+    #[test]
+    fn filter_matches_the_cwd_as_displayed() {
+        // raw Windows cwd carries backslashes but the table shows '/'
+        let r = row("D:\\Project\\ccm", "topic");
+        assert!(matches_filter(&r, "d:/project"));
+        assert!(matches_filter(&r, "D:\\Project"));
+        assert!(matches_filter(&r, "project/ccm"));
     }
 
     #[test]

@@ -22,8 +22,9 @@
 //                        (hex-id worktree/task dirs) the default views
 //                        skip, so an agent storm cannot crowd real
 //                        projects out of the newest-sessions view
-//   ccs <keyword>        full-text filter across the newest max(n,500)
-//                        transcripts (path / topic / messages, any case)
+//   ccs <keyword>        filter across the newest max(n,500) transcripts;
+//                        matches count only in conversation text (user /
+//                        assistant messages), any case
 //   ccs open <n>         resume session n from the last listing: spawn
 //                        `claude --resume <id>` with the child's cwd set to
 //                        the session's original project directory
@@ -43,10 +44,11 @@
 // bare hex fragment of 8+ chars that contains a letter, e.g. multica's
 // .../call-10-31bc8a6e6e05/workdir worktrees; and anything under the OS
 // temp directory, e.g. %TEMP%/dsh-ccacp-probe-*) are skipped without
-// consuming a pool slot in the default views; --all includes them,
-// keyword search always scans them. The hex signature also catches
-// hex-named tool caches (cargo registry, bazel) — --all is the escape
-// hatch.
+// consuming a pool slot in the default views AND out of the keyword scan
+// window -- --all includes them everywhere. Keyword matching covers
+// conversation text only (user/assistant). The hex signature also
+// catches hex-named tool caches (cargo registry, bazel) -- --all is the
+// escape hatch.
 // Reads only the transcripts directory; writes only the cache file.
 
 mod picker;
@@ -191,15 +193,17 @@ fn run(args: &[String]) -> i32 {
     files.sort_by_key(|f| std::cmp::Reverse(f.1));
 
     // ── candidate selection, newest first ────────────────────────────────
-    // Keyword mode full-text scans the newest max(n,500) transcripts and
-    // keeps the newest n matches — a search is explicit intent, so nothing
-    // is ever hidden there. Every other shape parses transcript heads
-    // newest first until it has `cap` visible rows: machine-generated
-    // agent workspaces (is_generated_workspace) are skipped without
-    // consuming a slot, so an agent storm minting dozens of hash-named
-    // worktrees a day cannot crowd real projects out of the view. Worst
-    // case (nearly everything generated) parses a head per transcript —
-    // the same read order as keyword mode's full-text scan.
+    // Keyword mode scans the newest max(n,500) transcripts for CONVERSATION
+    // hits (user/assistant text only — see human_text_hit) and keeps the
+    // newest n matches; generated workspaces leave the window unless
+    // --all, with the same skip-count hint as the listing. Every other
+    // shape parses transcript heads newest first until it has `cap`
+    // visible rows: machine-generated agent workspaces
+    // (is_generated_workspace) are skipped without consuming a slot, so
+    // an agent storm minting dozens of hash-named worktrees a day cannot
+    // crowd real projects out of the view. Worst case (nearly everything
+    // generated) parses a head per transcript — the same read order as
+    // keyword mode's full-text scan.
     let cap = if interactive { n.max(200) } else { n };
     let hide_generated = keyword.is_none() && !all;
     let temp_root = env::temp_dir().to_string_lossy().into_owned();
@@ -209,17 +213,28 @@ fn run(args: &[String]) -> i32 {
     if let Some(kw) = &keyword {
         let needle = kw.to_lowercase();
         for (path, secs) in files.iter().take(n.max(500)) {
+            let row = row_for(path, *secs);
+            // generated workspaces leave the scan window unless --all:
+            // they match their own harness boilerplate and would eat the
+            // result quota before older real matches are ever reached
+            if !all && is_generated_workspace(&row.cwd, &temp_root) {
+                hidden += 1;
+                continue;
+            }
             let Ok(raw) = fs::read(path) else {
                 continue;
             };
-            // lossy decode: one bad byte must not hide a whole transcript
-            if !String::from_utf8_lossy(&raw)
-                .to_lowercase()
-                .contains(&needle)
+            // lossy decode: one bad byte must not hide a whole transcript.
+            // C-speed prefilter on the whole file, then the hit must live
+            // in conversation text — machine context (skill listings,
+            // tool output) is identical across sessions and matches
+            // every query, collapsing search into "list the newest n"
+            let raw_s = String::from_utf8_lossy(&raw);
+            if !raw_s.to_lowercase().contains(&needle) || human_text_hit(&raw_s, &needle).is_none()
             {
                 continue;
             }
-            entries.push(row_for(path, *secs));
+            entries.push(row);
             if entries.len() >= n {
                 break;
             }
@@ -297,10 +312,11 @@ fn run(args: &[String]) -> i32 {
     out("ccs open <n>          resume there (plain claude)");
     out("ccs open <n> -m glm   resume routed via ccm");
     if hidden > 0 {
-        // "re-list", not "append": --all lists the newest n overall, so
-        // hidden rows displace older visible ones rather than extend them
+        // "re-run", not "append": --all re-lists/re-searches the newest n
+        // overall, so hidden rows displace older visible ones rather than
+        // extend them
         out(&format!(
-            "ccs --all             re-list with the {hidden} machine-generated agent workspace session(s) included"
+            "ccs --all             re-run with the {hidden} machine-generated agent workspace session(s) included"
         ));
     }
     0
@@ -636,6 +652,63 @@ fn encoded_fallback(path: &std::path::Path) -> String {
     re.replace(['-', '\\'], "/")
 }
 
+/// A keyword hit inside human-visible conversation text.
+#[derive(Debug, PartialEq)]
+pub(crate) struct TextHit {
+    /// "user" | "assistant" — whose words matched
+    pub(crate) role: String,
+    /// the matching text block, original casing, trimmed
+    pub(crate) text: String,
+}
+
+/// First occurrence of `needle` (already lowercased) inside user /
+/// assistant TEXT blocks, records in file order. Machine context — tool
+/// results, thinking, attachments (skill listings!), system records,
+/// harness-injected isMeta messages — never counts: it is dominated by
+/// boilerplate identical across sessions, which made unrelated queries
+/// return the same newest files. A user hit wins over an earlier
+/// assistant hit (your own words are the stronger recall key).
+/// Pure — pinned by tests.
+fn human_text_hit(raw: &str, needle: &str) -> Option<TextHit> {
+    let mut assistant_hit: Option<TextHit> = None;
+    for line in raw.split('\n') {
+        // cheap ASCII reject first; lowercase only message-carrying lines
+        if !line.contains("\"message\"") {
+            continue; // attachment/system/mode records carry no message
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("isSidechain").and_then(|s| s.as_bool()) == Some(true)
+            || v.get("isMeta").and_then(|s| s.as_bool()) == Some(true)
+        {
+            continue;
+        }
+        let Some(msg) = v.get("message") else {
+            continue;
+        };
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+        let Some(text) = user_text(Some(msg)) else {
+            continue;
+        };
+        if !text.to_lowercase().contains(needle) {
+            continue;
+        }
+        let hit = TextHit {
+            role: role.to_string(),
+            text: text.trim().to_string(),
+        };
+        if role == "user" {
+            return Some(hit);
+        }
+        assistant_hit = assistant_hit.or(Some(hit));
+    }
+    assistant_hit
+}
+
 /// One transcript file -> one picker row: id from the file stem, cwd and
 /// topic signals from the transcript head (plus a tail read only when
 /// the head yields no title at all), mtime formatted for display.
@@ -672,9 +745,9 @@ fn row_for(path: &std::path::Path, secs: u64) -> picker::PickerRow {
 /// split on `-`/`_`, yields a bare hex fragment >= 8 chars with a letter
 /// in it (the letter keeps digit-only names — compact dates like
 /// `20251101` — visible), or a cwd anywhere under `temp_root` (temp is
-/// ephemeral by contract). `--all` shows them anyway; keyword search
-/// always scans them. Pure — pinned by tests (temp_root passed in so the
-/// predicate stays machine-independent).
+/// ephemeral by contract). `--all` shows them anyway. Pure — pinned by
+/// tests (temp_root passed in so the predicate stays
+/// machine-independent).
 fn is_generated_workspace(cwd: &str, temp_root: &str) -> bool {
     cwd.split(['/', '\\'])
         .flat_map(|seg| seg.split(['-', '_']))
@@ -725,8 +798,10 @@ USAGE
                         (hex-id worktree/task dirs) the default views
                         skip, so agent storms cannot crowd out real
                         projects
-  ccs <keyword>         full-text filter over the newest max(n,500)
-                        transcripts (path / topic / messages, any case)
+  ccs <keyword>         filter over the newest max(n,500) transcripts;
+                        a match counts only inside conversation text
+                        (user / assistant messages, any case) - tool
+                        output and harness boilerplate never match
   ccs open <n>          resume session n in its original directory
   ccs open <n> -m glm   same, routed through ccm (ccm run glm -- --resume <id>)
   ccs open <n> --print  print a paste-ready command (PowerShell syntax)
@@ -801,6 +876,44 @@ mod tests {
             Some("我先看看".into())
         );
         assert_eq!(choose_topic(&head(None, None, None), None), None);
+    }
+
+    #[test]
+    fn keyword_hits_count_only_in_conversation_text() {
+        use super::human_text_hit;
+        let user_line = |t: &str| {
+            format!("{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"{t}\"}}}}")
+        };
+        let assistant_line = |t: &str| {
+            format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{t}\"}}]}}}}"
+            )
+        };
+        // user string content hits, case-insensitively
+        let raw = format!("{}\n{}", "{\"type\":\"mode\"}", user_line("把 Deploy 改掉"));
+        let hit = human_text_hit(&raw, "deploy").unwrap();
+        assert_eq!(hit.role, "user");
+        assert_eq!(hit.text, "把 Deploy 改掉");
+        // a user hit wins over an earlier assistant hit
+        let raw = format!(
+            "{}\n{}",
+            assistant_line("deploy scripts"),
+            user_line("Deploy 好了吗")
+        );
+        assert_eq!(human_text_hit(&raw, "deploy").unwrap().role, "user");
+        // assistant text blocks are the fallback
+        let raw = assistant_line("fixed the Deploy step");
+        assert_eq!(human_text_hit(&raw, "deploy").unwrap().role, "assistant");
+        // tool_result blocks, attachments, isMeta, sidechains never match
+        let tool = "{\"type\":\"user\",\"isMeta\":false,\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"content\":\"deploy OK\"}]}}";
+        let attachment = "{\"type\":\"attachment\",\"attachment\":{\"text\":\"deploy listing\"}}";
+        let meta = "{\"type\":\"user\",\"isMeta\":true,\"message\":{\"role\":\"user\",\"content\":\"deploy meta\"}}";
+        let side = "{\"type\":\"user\",\"isSidechain\":true,\"message\":{\"role\":\"user\",\"content\":\"deploy side\"}}";
+        let raw = format!("{tool}\n{attachment}\n{meta}\n{side}");
+        assert_eq!(human_text_hit(&raw, "deploy"), None);
+        // thinking blocks are not visible text
+        let think = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"deploy maybe\"}]}}";
+        assert_eq!(human_text_hit(&think, "deploy"), None);
     }
 
     #[test]
